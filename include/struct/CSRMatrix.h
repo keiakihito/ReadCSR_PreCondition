@@ -8,14 +8,12 @@
 #include <cusparse_v2.h>
 #include <time.h>
 
-#define CHECK(call){ \
-    const cudaError_t cuda_ret = call; \
-    if(cuda_ret != cudaSuccess){ \
-        printf("Error: %s:%d,  ", __FILE__, __LINE__ );\
-        printf("code: %d, reason: %s \n", cuda_ret, cudaGetErrorString(cuda_ret));\
-        exit(-1); \
-    }\
-}
+#include "../functions/helper.h"
+// #include "../functions/cuBLAS_util.h"
+// #include "../functions/cuSPARSE_util.h"
+// #include "../functions/cuSOLVER_util.h"
+
+#define max(a,b)((a)>(b) ? (a):(b))
 
 // CSR Matrix
 struct CSRMatrix{
@@ -26,6 +24,18 @@ struct CSRMatrix{
     int *col_indices;
     double *vals;
 };
+
+
+CSRMatrix constructCSRMatrix(int numOfRow, int numOfClm, int nnz, int* row_offsets, int* col_indices, double* vals);
+void genTridiag(int *I, int *J, double *val, int N, int nz);
+CSRMatrix generateSparseSPDMatrixCSR(int N);
+CSRMatrix generateSparseIdentityMatrixCSR(int N);
+void freeCSRMatrix(CSRMatrix &csrMtx);
+double* csrToDense(const CSRMatrix &csrMtx);
+void print_CSRMtx(const CSRMatrix &csrMtx);
+
+//Construct precondtion matrix M with incomplete cholesky factorization such that M ~ L_hat * L_hat'
+CSRMatrix constructPreConditionMatrixCSR(cusparseHandle_t cusparseHandler, CSRMatrix mtxA);
 
 //Constructor like function
 CSRMatrix constructCSRMatrix(int numOfRow, int numOfClm, int nnz, int* row_offsets, int* col_indices, double* vals){
@@ -49,6 +59,7 @@ CSRMatrix constructCSRMatrix(int numOfRow, int numOfClm, int nnz, int* row_offse
     
     return csrMtx;
 }
+
 
 
 // Generate a random tridiagonal symmetric matrix
@@ -207,7 +218,120 @@ void print_CSRMtx(const CSRMatrix &csrMtx)
 
 } // end of print_CSRMtx
 
+//Construct precondtion matrix M with incomplete cholesky factorization such that M ~ L_hat * L_hat'
+CSRMatrix constructPreConditionMatrixCSR(cusparseHandle_t cusparseHandler, CSRMatrix mtxA){
 
+    
+    //(0) Set up variables
+    cusparseMatDescr_t descr_M = 0;
+    cusparseMatDescr_t descr_L = 0;
+
+    // we need one info for csric02 and two info's for csrsv2
+    csric02Info_t info_M =0;
+    csrsv2Info_t info_L = 0;
+    csrsv2Info_t info_Lt =0;
+
+    int structural_zero = 0;
+    int numerical_zero = 0;
+
+    //(1) Allocate memory and copy mtxA values to GPU
+    int N = mtxA.numOfRows;
+    int numOfnz = mtxA.numOfnz;
+    int *row_offsets_d = NULL;
+    int *col_indices_d = NULL;
+    double * vals_d = NULL;
+
+    cusparseStatus_t status;
+    
+
+    CHECK(cudaMalloc((void**)&row_offsets_d, (N+1) * sizeof(int)));
+    CHECK(cudaMalloc((void**)&col_indices_d, numOfnz * sizeof(int)));
+    CHECK(cudaMalloc((void**)&vals_d, numOfnz * sizeof(double)));
+
+    CHECK(cudaMemcpy(row_offsets_d, mtxA.row_offsets, (N+1) * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(col_indices_d, mtxA.col_indices, (numOfnz) * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(vals_d, mtxA.vals, (numOfnz) * sizeof(double), cudaMemcpyHostToDevice));
+
+    //(2) Create descriptors
+    // - matrix M is base-1
+    // - matrix L is base-1
+    // - matrix L is lower triangular
+    // - matrix L has non-unit diagonal
+    CHECK_CUSPARSE(cusparseCreateMatDescr(&descr_M));
+    CHECK_CUSPARSE(cusparseSetMatIndexBase(descr_M,CUSPARSE_INDEX_BASE_ONE));
+    CHECK_CUSPARSE(cusparseSetMatType(descr_M, CUSPARSE_MATRIX_TYPE_GENERAL));
+    CHECK_CUSPARSE(cusparseCreateMatDescr(&descr_L));
+    CHECK_CUSPARSE(cusparseSetMatIndexBase(descr_L, CUSPARSE_INDEX_BASE_ONE));
+    CHECK_CUSPARSE(cusparseSetMatType(descr_L, CUSPARSE_MATRIX_TYPE_GENERAL));
+    CHECK_CUSPARSE(cusparseSetMatFillMode(descr_L, CUSPARSE_FILL_MODE_LOWER));
+    CHECK_CUSPARSE(cusparseSetMatDiagType(descr_L, CUSPARSE_DIAG_TYPE_NON_UNIT));
+    CHECK_CUSPARSE(cusparseCreateCsric02Info(&info_M));
+    CHECK_CUSPARSE(cusparseCreateCsrsv2Info(&info_L));
+    CHECK_CUSPARSE(cusparseCreateCsrsv2Info(&info_Lt));
+
+    //(2) Calculate buffer size and allocate space
+    int pBufferSize_M = 0;
+    int pBufferSize_L = 0;
+    int pBufferSize_Lt = 0;
+    int pBufferSize = 0;
+    void *pBuffer = 0;
+    CHECK_CUSPARSE(cusparseDcsric02_bufferSize(cusparseHandler, N, numOfnz, descr_M, vals_d, row_offsets_d, col_indices_d, info_M, &pBufferSize_M));
+    CHECK_CUSPARSE(cusparseDcsrsv2_bufferSize(cusparseHandler, CUSPARSE_OPERATION_NON_TRANSPOSE, N, numOfnz, descr_L, vals_d, row_offsets_d, col_indices_d, info_L, &pBufferSize_L));
+    CHECK_CUSPARSE(cusparseDcsrsv2_bufferSize(cusparseHandler, CUSPARSE_OPERATION_NON_TRANSPOSE, N, numOfnz, descr_L, vals_d, row_offsets_d, col_indices_d, info_Lt, &pBufferSize_Lt));
+    
+    // pBuffer returned by cudaMalloc is automatically aligned to 128 bytes.
+    pBufferSize = max(pBufferSize_M, max(pBufferSize_L, pBufferSize_Lt));
+    CHECK(cudaMalloc(&pBuffer, pBufferSize));
+
+    
+    // (4): perform analysis of incomplete Cholesky on M
+    //      perform analysis of triangular solve on L
+    //      perform analysis of triangular solve on L'
+    // The lower triangular part of M has the same sparsity pattern as L, so
+    // we can do analysis of csric02 and csrsv2 simultaneously.
+    CHECK_CUSPARSE(cusparseDcsric02_analysis(cusparseHandler, N, numOfnz, descr_M, vals_d, row_offsets_d, col_indices_d, info_M, CUSPARSE_SOLVE_POLICY_NO_LEVEL, pBuffer));
+    status = cusparseXcsric02_zeroPivot(cusparseHandler, info_M, &structural_zero);
+    if(CUSPARSE_STATUS_ZERO_PIVOT == status){
+        printf("A(%d,%d) is missing\n", structural_zero, structural_zero);
+    }
+
+    CHECK_CUSPARSE(cusparseDcsrsv2_analysis(cusparseHandler, CUSPARSE_OPERATION_NON_TRANSPOSE, N, numOfnz, descr_L, vals_d, row_offsets_d, col_indices_d, info_L, CUSPARSE_SOLVE_POLICY_NO_LEVEL, pBuffer));
+    CHECK_CUSPARSE(cusparseDcsrsv2_analysis(cusparseHandler, CUSPARSE_OPERATION_TRANSPOSE, N, numOfnz, descr_L, vals_d, row_offsets_d, col_indices_d, info_Lt, CUSPARSE_SOLVE_POLICY_USE_LEVEL, pBuffer));
+
+    //(5) Perform Incomplete Cholesky Factorization
+    CHECK_CUSPARSE(cusparseDcsric02(cusparseHandler, N, numOfnz, descr_M, vals_d, row_offsets_d, col_indices_d, info_M, CUSPARSE_SOLVE_POLICY_NO_LEVEL, pBuffer));
+    status = cusparseXcsric02_zeroPivot(cusparseHandler, info_M, &numerical_zero);
+    if(CUSPARSE_STATUS_ZERO_PIVOT == status){
+        printf("L(%d, %d) is zero\n", numerical_zero, numerical_zero);
+    }
+
+    //(6) Extract the lower triangular matrix L_hat from GPU to CPU
+    int *row_offsets_h = (int*)malloc((N+1) * sizeof(int));
+    int *col_indices_h = (int*)malloc((numOfnz) * sizeof(int));
+    double *vals_h = (double*)malloc(numOfnz * sizeof(double));
+    CHECK(cudaMemcpy(row_offsets_h, row_offsets_d, (N + 1) * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(col_indices_h, col_indices_d, numOfnz * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(vals_h, vals_d, numOfnz * sizeof(double), cudaMemcpyDeviceToHost));
+
+    //(7) Create precondition CSRMatrix object
+    CSRMatrix csrMtxM;
+    csrMtxM.numOfRows = N;
+    csrMtxM.numOfClms = N;
+    csrMtxM.numOfnz = numOfnz;
+    csrMtxM.row_offsets = row_offsets_h;
+    csrMtxM.col_indices = col_indices_h;
+    csrMtxM.vals = vals_h;
+
+    //(8) Free memeory
+    CHECK(cudaFree(pBuffer));
+    CHECK_CUSPARSE(cusparseDestroyMatDescr(descr_M));
+    CHECK_CUSPARSE(cusparseDestroyMatDescr(descr_L));
+    CHECK_CUSPARSE(cusparseDestroyCsric02Info(info_M));
+    CHECK_CUSPARSE(cusparseDestroyCsrsv2Info(info_L));
+    CHECK_CUSPARSE(cusparseDestroyCsrsv2Info(info_Lt));
+
+    return csrMtxM;
+}
 
 
 #endif // CSRMatix_h

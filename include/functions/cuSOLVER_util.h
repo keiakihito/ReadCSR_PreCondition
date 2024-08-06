@@ -10,6 +10,8 @@
 #include <sys/time.h>
 
 #include "helper.h"
+#include "../struct/CSRMatrix.h"
+#include "cuBLAS_util.h"
 
 
 //Inverse funtion with sub functions
